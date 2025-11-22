@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 import urllib.request
 import socket
 
@@ -124,28 +124,48 @@ class FHSHandler(BaseHTTPRequestHandler):
         
         elif self.path.startswith("/download/"):
             filename = unquote(self.path[10:])
-            file_path = Path(self.shared_folder) / filename
             
-            if not file_path.exists() or not file_path.is_relative_to(self.shared_folder):
-                self.send_error(404, "File not found")
+            # パスの正規化とセキュリティチェック
+            try:
+                file_path = (Path(self.shared_folder) / filename).resolve()
+                
+                # セキュリティ: 共有フォルダ外へのアクセスを防ぐ
+                if not str(file_path).startswith(str(Path(self.shared_folder).resolve())):
+                    self.send_error(403, "Access denied")
+                    if self.log_callback:
+                        self.log_callback(f"[エラー] 不正アクセス試行: {filename}")
+                    return
+                
+                if not file_path.exists():
+                    self.send_error(404, "File not found")
+                    if self.log_callback:
+                        self.log_callback(f"[エラー] ファイル不明: {filename}")
+                    return
+                
+                # ファイルサイズ取得
+                file_size = file_path.stat().st_size
+                
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                
+                encrypted = Crypto.encrypt(data, self.password_hash) if CRYPTO_AVAILABLE else Crypto.xor_encrypt(data, self.password_hash)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", len(encrypted))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(encrypted)
+                self.wfile.flush()
+                
                 if self.log_callback:
-                    self.log_callback(f"[エラー] ファイル不明: {filename}")
-                return
-            
-            with open(file_path, "rb") as f:
-                data = f.read()
-            
-            encrypted = Crypto.encrypt(data, self.password_hash) if CRYPTO_AVAILABLE else Crypto.xor_encrypt(data, self.password_hash)
-            
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", len(encrypted))
-            self.end_headers()
-            self.wfile.write(encrypted)
-            
-            if self.log_callback:
-                size_mb = len(data) / (1024 * 1024)
-                self.log_callback(f"[送信] {filename} -> {client_ip} ({size_mb:.2f}MB)")
+                    size_mb = len(data) / (1024 * 1024)
+                    self.log_callback(f"[送信] {filename} -> {client_ip} ({size_mb:.2f}MB)")
+                    
+            except Exception as e:
+                self.send_error(500, f"Internal server error: {str(e)}")
+                if self.log_callback:
+                    self.log_callback(f"[エラー] {filename}: {type(e).__name__} - {str(e)}")
 
 
 # ========== Windows 98風ボタン ==========
@@ -302,6 +322,7 @@ class FHSApp:
 
 Version 0.0.1
 製作者: soramame72
+Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
 """
         messagebox.showinfo("FHSについて", about_text)
     
@@ -830,33 +851,60 @@ Version 0.0.1
             file_info = self.files_data[idx]
             filename = file_info["name"]
             
-            url = f"http://{host}:{port}/download/{filename}"
+            # リトライ機能付きダウンロード
+            max_retries = 3
+            retry_count = 0
+            downloaded = False
             
-            try:
-                self.status_label.config(text=f" ダウンロード中: {filename}")
-                self.root.update()
+            while retry_count < max_retries and not downloaded:
+                # ファイル名をURLエンコード
+                encoded_filename = quote(filename, safe='/')
+                url = f"http://{host}:{port}/download/{encoded_filename}"
                 
-                req = urllib.request.Request(url, headers={"Authorization": auth_hash})
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    encrypted_data = response.read()
+                try:
+                    self.status_label.config(text=f" ダウンロード中 ({retry_count + 1}/{max_retries}): {filename}")
+                    self.root.update()
                     
-                    if CRYPTO_AVAILABLE:
-                        decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
+                    # ファイル名をURLエンコード
+                    encoded_filename = quote(filename, safe='/')
+                    req = urllib.request.Request(f"http://{host}:{port}/download/{encoded_filename}", headers={"Authorization": auth_hash})
+                    req.add_header('Connection', 'keep-alive')
+                    
+                    with urllib.request.urlopen(req, timeout=120) as response:
+                        encrypted_data = response.read()
+                        
+                        if CRYPTO_AVAILABLE:
+                            decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
+                        else:
+                            decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
+                        
+                        save_file = Path(save_path) / Path(filename).name
+                        save_file.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        with open(save_file, "wb") as f:
+                            f.write(decrypted_data)
+                        
+                        success_count += 1
+                        downloaded = True
+                        
+                        # 連続ダウンロード時の待機時間
+                        import time
+                        time.sleep(0.1)
+                        
+                except Exception as e:
+                    retry_count += 1
+                    error_msg = f"ファイル: {filename}\nエラー: {type(e).__name__}\n{str(e)}"
+                    print(f"[エラー ({retry_count}/{max_retries})] {error_msg}")
+                    
+                    if retry_count >= max_retries:
+                        fail_count += 1
+                        messagebox.showerror("ダウンロードエラー", f"ファイル: {filename}\n\n{max_retries}回リトライしましたが失敗しました。\n\nエラー: {type(e).__name__}\n{str(e)}")
                     else:
-                        decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
-                    
-                    save_file = Path(save_path) / Path(filename).name
-                    save_file.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    with open(save_file, "wb") as f:
-                        f.write(decrypted_data)
-                    
-                    success_count += 1
-            except Exception as e:
-                fail_count += 1
-                messagebox.showerror("ダウンロードエラー", f"ファイル: {filename}\n\nエラー: {type(e).__name__}\n{str(e)}")
+                        # リトライ前に少し待機
+                        import time
+                        time.sleep(0.5)
         
-        if success_count > 0:
+        if success_count > 0 or fail_count > 0:
             self.status_label.config(text=f" 完了: {success_count}ファイル成功, {fail_count}ファイル失敗")
             messagebox.showinfo("完了", f"ダウンロード完了\n\n成功: {success_count}ファイル\n失敗: {fail_count}ファイル\n\n保存先: {save_path}")
     
@@ -898,32 +946,58 @@ Version 0.0.1
         
         for file_info in self.files_data:
             filename = file_info["name"]
-            url = f"http://{host}:{port}/download/{filename}"
             
-            try:
-                self.status_label.config(text=f" [{success_count + fail_count + 1}/{len(self.files_data)}] {filename}")
-                self.root.update()
+            # リトライ機能付きダウンロード
+            max_retries = 3
+            retry_count = 0
+            downloaded = False
+            
+            while retry_count < max_retries and not downloaded:
+                # ファイル名をURLエンコード
+                encoded_filename = quote(filename, safe='/')
+                url = f"http://{host}:{port}/download/{encoded_filename}"
                 
-                req = urllib.request.Request(url, headers={"Authorization": auth_hash})
-                with urllib.request.urlopen(req, timeout=60) as response:
-                    encrypted_data = response.read()
+                try:
+                    self.status_label.config(text=f" [{success_count + fail_count + 1}/{len(self.files_data)}] リトライ {retry_count + 1}/{max_retries}: {filename}")
+                    self.root.update()
                     
-                    if CRYPTO_AVAILABLE:
-                        decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
+                    # ファイル名をURLエンコード
+                    encoded_filename = quote(filename, safe='/')
+                    req = urllib.request.Request(f"http://{host}:{port}/download/{encoded_filename}", headers={"Authorization": auth_hash})
+                    req.add_header('Connection', 'keep-alive')
+                    
+                    with urllib.request.urlopen(req, timeout=120) as response:
+                        encrypted_data = response.read()
+                        
+                        if CRYPTO_AVAILABLE:
+                            decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
+                        else:
+                            decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
+                        
+                        save_file = Path(save_path) / filename
+                        save_file.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        with open(save_file, "wb") as f:
+                            f.write(decrypted_data)
+                        
+                        success_count += 1
+                        downloaded = True
+                        
+                        # 連続ダウンロード時の待機時間
+                        import time
+                        time.sleep(0.1)
+                        
+                except Exception as e:
+                    retry_count += 1
+                    error_msg = f"ファイル: {filename}\nエラー: {type(e).__name__}\n{str(e)}"
+                    print(f"[エラー ({retry_count}/{max_retries})] {error_msg}")
+                    
+                    if retry_count >= max_retries:
+                        fail_count += 1
                     else:
-                        decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
-                    
-                    save_file = Path(save_path) / filename
-                    save_file.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    with open(save_file, "wb") as f:
-                        f.write(decrypted_data)
-                    
-                    success_count += 1
-            except Exception as e:
-                fail_count += 1
-                error_msg = f"ファイル: {filename}\nエラー: {type(e).__name__}\n{str(e)}"
-                print(f"[エラー] {error_msg}")
+                        # リトライ前に少し待機
+                        import time
+                        time.sleep(0.5)
         
         self.status_label.config(text=f" 全ダウンロード完了: {success_count}成功 / {fail_count}失敗")
         messagebox.showinfo(
