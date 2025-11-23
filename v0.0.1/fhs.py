@@ -8,14 +8,13 @@ import json
 import os
 import sys
 import re
+import time
 from pathlib import Path
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote, quote
-import urllib.request
 import socket
+import struct
 
-# 暗号化関連（標準ライブラリのみ使用）
+# 暗号化関連
 try:
     from Crypto.Cipher import AES
     from Crypto.Random import get_random_bytes
@@ -27,7 +26,6 @@ except ImportError:
 
 # ========== 暗号化ユーティリティ ==========
 class SimpleCrypto:
-    """簡易暗号化（pycryptodomがない場合の代替）"""
     @staticmethod
     def xor_encrypt(data: bytes, password: str) -> bytes:
         key = hashlib.sha256(password.encode()).digest()
@@ -68,104 +66,261 @@ else:
     Crypto = SimpleCrypto
 
 
-# ========== HTTPサーバーハンドラ ==========
-class FHSHandler(BaseHTTPRequestHandler):
-    shared_folder = None
-    password_hash = None
-    blocked_ips = set()
-    failed_attempts = {}
-    log_callback = None
+# ========== P2Pサーバー ==========
+class P2PServer:
+    def __init__(self, folder, password, port, use_password, use_ipban, log_callback):
+        self.folder = Path(folder)
+        self.password = password
+        self.password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+        self.port = port
+        self.use_password = use_password
+        self.use_ipban = use_ipban
+        self.log_callback = log_callback
+        self.server_socket = None
+        self.running = False
+        self.blocked_ips = set()
+        self.failed_attempts = {}
     
-    def log_message(self, format, *args):
-        pass
-    
-    def do_GET(self):
-        client_ip = self.client_address[0]
+    def start(self):
+        self.running = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(("0.0.0.0", self.port))
+        self.server_socket.listen(5)
+        self.log_callback(f"[起動] P2Pサーバー起動: 0.0.0.0:{self.port}")
         
-        if client_ip in self.blocked_ips:
-            self.send_error(403, "IP Blocked")
-            if self.log_callback:
-                self.log_callback(f"[拒否] ブロック済みIP: {client_ip}")
-            return
+        if not self.use_password:
+            self.log_callback("[情報] パスワード認証: 無効")
+        if not self.use_ipban:
+            self.log_callback("[情報] IPブロック: 無効")
         
-        auth = self.headers.get("Authorization", "")
-        if auth != self.password_hash:
-            self.failed_attempts[client_ip] = self.failed_attempts.get(client_ip, 0) + 1
-            if self.failed_attempts[client_ip] >= 3:
-                self.blocked_ips.add(client_ip)
-                if self.log_callback:
-                    self.log_callback(f"[警告] IP自動ブロック: {client_ip}")
-            self.send_error(403, "Unauthorized")
-            if self.log_callback:
-                self.log_callback(f"[拒否] 認証失敗 ({self.failed_attempts[client_ip]}/3): {client_ip}")
-            return
-        
-        self.failed_attempts[client_ip] = 0
-        
-        if self.path == "/files":
-            files = []
-            for item in Path(self.shared_folder).rglob("*"):
-                if item.is_file():
-                    rel_path = item.relative_to(self.shared_folder)
-                    files.append({
-                        "name": str(rel_path).replace("\\", "/"),
-                        "size": item.stat().st_size
-                    })
-            
-            response = json.dumps(files).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(response))
-            self.end_headers()
-            self.wfile.write(response)
-            
-            if self.log_callback:
-                self.log_callback(f"[接続] ファイル一覧送信: {client_ip} ({len(files)}ファイル)")
-        
-        elif self.path.startswith("/download/"):
-            filename = unquote(self.path[10:])
-            
-            # パスの正規化とセキュリティチェック
+        while self.running:
             try:
-                file_path = (Path(self.shared_folder) / filename).resolve()
-                
-                # セキュリティ: 共有フォルダ外へのアクセスを防ぐ
-                if not str(file_path).startswith(str(Path(self.shared_folder).resolve())):
-                    self.send_error(403, "Access denied")
-                    if self.log_callback:
-                        self.log_callback(f"[エラー] 不正アクセス試行: {filename}")
-                    return
-                
-                if not file_path.exists():
-                    self.send_error(404, "File not found")
-                    if self.log_callback:
-                        self.log_callback(f"[エラー] ファイル不明: {filename}")
-                    return
-                
-                # ファイルサイズ取得
-                file_size = file_path.stat().st_size
-                
-                with open(file_path, "rb") as f:
-                    data = f.read()
-                
-                encrypted = Crypto.encrypt(data, self.password_hash) if CRYPTO_AVAILABLE else Crypto.xor_encrypt(data, self.password_hash)
-                
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", len(encrypted))
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                self.wfile.write(encrypted)
-                self.wfile.flush()
-                
-                if self.log_callback:
-                    size_mb = len(data) / (1024 * 1024)
-                    self.log_callback(f"[送信] {filename} -> {client_ip} ({size_mb:.2f}MB)")
-                    
+                self.server_socket.settimeout(1.0)
+                try:
+                    client_socket, client_address = self.server_socket.accept()
+                    threading.Thread(target=self.handle_client, args=(client_socket, client_address), daemon=True).start()
+                except socket.timeout:
+                    continue
             except Exception as e:
-                self.send_error(500, f"Internal server error: {str(e)}")
-                if self.log_callback:
-                    self.log_callback(f"[エラー] {filename}: {type(e).__name__} - {str(e)}")
+                if self.running:
+                    self.log_callback(f"[エラー] {str(e)}")
+    
+    def handle_client(self, client_socket, client_address):
+        client_ip = client_address[0]
+        
+        try:
+            # IPブロックチェック
+            if self.use_ipban and client_ip in self.blocked_ips:
+                self.send_response(client_socket, {"status": "error", "message": "IP Blocked"})
+                self.log_callback(f"[拒否] ブロック済みIP: {client_ip}")
+                client_socket.close()
+                return
+            
+            # リクエスト受信
+            request_data = self.receive_data(client_socket)
+            if not request_data:
+                client_socket.close()
+                return
+            
+            request = json.loads(request_data.decode('utf-8'))
+            command = request.get("command")
+            
+            # パスワード認証
+            if self.use_password:
+                auth = request.get("auth", "")
+                if auth != self.password_hash:
+                    if self.use_ipban:
+                        self.failed_attempts[client_ip] = self.failed_attempts.get(client_ip, 0) + 1
+                        if self.failed_attempts[client_ip] >= 3:
+                            self.blocked_ips.add(client_ip)
+                            self.log_callback(f"[警告] IP自動ブロック: {client_ip}")
+                    
+                    self.send_response(client_socket, {"status": "error", "message": "Unauthorized"})
+                    self.log_callback(f"[拒否] 認証失敗: {client_ip}")
+                    client_socket.close()
+                    return
+                
+                if self.use_ipban:
+                    self.failed_attempts[client_ip] = 0
+            
+            # コマンド処理
+            if command == "list":
+                self.handle_list(client_socket, client_ip)
+            elif command == "download":
+                filename = request.get("filename")
+                self.handle_download(client_socket, client_ip, filename)
+            else:
+                self.send_response(client_socket, {"status": "error", "message": "Unknown command"})
+            
+        except Exception as e:
+            self.log_callback(f"[エラー] {client_ip}: {type(e).__name__} - {str(e)}")
+        finally:
+            client_socket.close()
+    
+    def handle_list(self, client_socket, client_ip):
+        files = []
+        for item in self.folder.rglob("*"):
+            if item.is_file():
+                rel_path = item.relative_to(self.folder)
+                files.append({
+                    "name": str(rel_path).replace("\\", "/"),
+                    "size": item.stat().st_size
+                })
+        
+        self.send_response(client_socket, {"status": "success", "files": files})
+        self.log_callback(f"[接続] ファイル一覧送信: {client_ip} ({len(files)}ファイル)")
+    
+    def handle_download(self, client_socket, client_ip, filename):
+        try:
+            file_path = (self.folder / filename).resolve()
+            
+            # セキュリティチェック
+            if not str(file_path).startswith(str(self.folder.resolve())):
+                self.send_response(client_socket, {"status": "error", "message": "Access denied"})
+                self.log_callback(f"[エラー] 不正アクセス試行: {filename}")
+                return
+            
+            if not file_path.exists():
+                self.send_response(client_socket, {"status": "error", "message": "File not found"})
+                self.log_callback(f"[エラー] ファイル不明: {filename}")
+                return
+            
+            with open(file_path, "rb") as f:
+                data = f.read()
+            
+            # 暗号化（パスワードありの場合のみ）
+            if self.use_password and self.password:
+                if CRYPTO_AVAILABLE:
+                    data = Crypto.encrypt(data, self.password_hash)
+                else:
+                    data = Crypto.xor_encrypt(data, self.password_hash)
+            
+            self.send_response(client_socket, {"status": "success", "size": len(data)})
+            self.send_data(client_socket, data)
+            
+            size_mb = len(data) / (1024 * 1024)
+            self.log_callback(f"[送信] {filename} -> {client_ip} ({size_mb:.2f}MB)")
+            
+        except Exception as e:
+            self.send_response(client_socket, {"status": "error", "message": str(e)})
+            self.log_callback(f"[エラー] {filename}: {type(e).__name__} - {str(e)}")
+    
+    def send_response(self, client_socket, response):
+        data = json.dumps(response).encode('utf-8')
+        self.send_data(client_socket, data)
+    
+    def send_data(self, client_socket, data):
+        # データ長を送信
+        length = len(data)
+        client_socket.sendall(struct.pack('!I', length))
+        # データ本体を送信
+        client_socket.sendall(data)
+    
+    def receive_data(self, client_socket):
+        # データ長を受信
+        length_data = client_socket.recv(4)
+        if not length_data:
+            return None
+        length = struct.unpack('!I', length_data)[0]
+        
+        # データ本体を受信
+        data = b''
+        while len(data) < length:
+            chunk = client_socket.recv(min(length - len(data), 8192))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+    
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+
+# ========== P2Pクライアント ==========
+class P2PClient:
+    def __init__(self, host, port, password, use_password):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+        self.use_password = use_password
+    
+    def connect_and_send(self, request):
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.settimeout(30)
+        
+        try:
+            client_socket.connect((self.host, self.port))
+            
+            # 認証情報を追加
+            if self.use_password:
+                request["auth"] = self.password_hash
+            
+            # リクエスト送信
+            self.send_data(client_socket, json.dumps(request).encode('utf-8'))
+            
+            # レスポンス受信
+            response_data = self.receive_data(client_socket)
+            response = json.loads(response_data.decode('utf-8'))
+            
+            return client_socket, response
+        except Exception as e:
+            client_socket.close()
+            raise e
+    
+    def get_file_list(self):
+        request = {"command": "list"}
+        client_socket, response = self.connect_and_send(request)
+        client_socket.close()
+        
+        if response.get("status") == "success":
+            return response.get("files", [])
+        else:
+            raise Exception(response.get("message", "Unknown error"))
+    
+    def download_file(self, filename):
+        request = {"command": "download", "filename": filename}
+        client_socket, response = self.connect_and_send(request)
+        
+        try:
+            if response.get("status") == "success":
+                # ファイルデータ受信
+                data = self.receive_data(client_socket)
+                
+                # 復号化（パスワードありの場合のみ）
+                if self.use_password and self.password:
+                    if CRYPTO_AVAILABLE:
+                        data = Crypto.decrypt(data, self.password_hash)
+                    else:
+                        data = Crypto.xor_decrypt(data, self.password_hash)
+                
+                return data
+            else:
+                raise Exception(response.get("message", "Unknown error"))
+        finally:
+            client_socket.close()
+    
+    def send_data(self, client_socket, data):
+        length = len(data)
+        client_socket.sendall(struct.pack('!I', length))
+        client_socket.sendall(data)
+    
+    def receive_data(self, client_socket):
+        length_data = client_socket.recv(4)
+        if not length_data:
+            return None
+        length = struct.unpack('!I', length_data)[0]
+        
+        data = b''
+        while len(data) < length:
+            chunk = client_socket.recv(min(length - len(data), 8192))
+            if not chunk:
+                return None
+            data += chunk
+        return data
 
 
 # ========== Windows 98風ボタン ==========
@@ -199,11 +354,11 @@ class Win98Button(tk.Button):
     def on_enter(self, e):
         if self['state'] != 'disabled':
             current_bg = self['bg']
-            if current_bg == "#00AA00" or current_bg == "#4CAF50":
+            if current_bg in ["#00AA00", "#4CAF50"]:
                 self['bg'] = "#00CC00"
-            elif current_bg == "#CC0000" or current_bg == "#F44336":
+            elif current_bg in ["#CC0000", "#F44336"]:
                 self['bg'] = "#FF0000"
-            elif current_bg == "#000080" or current_bg == "#2196F3":
+            elif current_bg in ["#000080", "#2196F3"]:
                 self['bg'] = "#0000AA"
             elif current_bg == "#FF9800":
                 self['bg'] = "#FFB300"
@@ -228,10 +383,9 @@ class FHSApp:
     def __init__(self, root):
         self.root = root
         self.root.title("FHS")
-        self.root.geometry("850x650")
+        self.root.geometry("850x700")
         self.root.resizable(True, True)
         
-        # シンプルなカラー
         self.bg_color = "#E8E8E8"
         self.panel_color = "#F5F5F5"
         self.text_color = "#000000"
@@ -309,7 +463,7 @@ class FHSApp:
         
         self.status_label = tk.Label(
             status_frame,
-            text=" 準備完了",
+            text=" 準備完了 ",
             font=("MS UI Gothic", 9),
             bg="#D0D0D0",
             fg="#000000",
@@ -320,9 +474,8 @@ class FHSApp:
     def show_about(self):
         about_text = """FHS
 
-Version 0.0.1
+Version 0.0.1 - Macintosh Edition
 製作者: soramame72
-Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
 """
         messagebox.showinfo("FHSについて", about_text)
     
@@ -383,7 +536,16 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             relief=tk.SOLID,
             bd=1
         )
-        self.password_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.password_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        
+        self.use_password_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            password_frame,
+            text="パスワード認証を使用",
+            variable=self.use_password_var,
+            bg=self.panel_color,
+            font=("MS UI Gothic", 9)
+        ).pack(side=tk.LEFT)
         
         # ポート
         port_frame = tk.Frame(config_frame, bg=self.panel_color)
@@ -404,8 +566,21 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             bd=1,
             width=15
         )
-        self.port_entry.insert(0, "8888")
+        self.port_entry.insert(0, "9999")
         self.port_entry.pack(side=tk.LEFT)
+        
+        # IPブロック設定
+        ipban_frame = tk.Frame(config_frame, bg=self.panel_color)
+        ipban_frame.pack(fill=tk.X, padx=10, pady=8)
+        
+        self.use_ipban_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            ipban_frame,
+            text="IPブロック機能を使用（3回認証失敗で自動ブロック）",
+            variable=self.use_ipban_var,
+            bg=self.panel_color,
+            font=("MS UI Gothic", 9)
+        ).pack(side=tk.LEFT)
         
         # サーバーアドレス表示
         self.server_info_frame = tk.Frame(config_frame, bg="#FFFACD", relief=tk.SOLID, bd=1)
@@ -553,7 +728,16 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             relief=tk.SOLID,
             bd=1
         )
-        self.client_password_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.client_password_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        
+        self.client_use_password_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            password_frame,
+            text="パスワード認証を使用",
+            variable=self.client_use_password_var,
+            bg=self.panel_color,
+            font=("MS UI Gothic", 9)
+        ).pack(side=tk.LEFT)
         
         # ファイル一覧フレーム
         file_frame = tk.LabelFrame(
@@ -637,18 +821,18 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
     
     def parse_server_address(self, address_input):
         """様々な形式のアドレスをパース"""
-        address_input = re.sub(r'^https?://', '', address_input.strip())
+        address_input = address_input.strip()
         
         if ':' in address_input:
             parts = address_input.split(':')
             host = parts[0]
             try:
-                port = int(parts[1].split('/')[0])
+                port = int(parts[1])
             except:
-                port = 8888
+                port = 9999
         else:
-            host = address_input.split('/')[0]
-            port = 8888
+            host = address_input
+            port = 9999
         
         return host, port
     
@@ -660,7 +844,7 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             s.close()
             return ip
         except Exception as e:
-            return f"127.0.0.1"
+            return "127.0.0.1"
     
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -694,13 +878,15 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
         folder = self.folder_entry.get()
         password = self.password_entry.get()
         port_str = self.port_entry.get()
+        use_password = self.use_password_var.get()
+        use_ipban = self.use_ipban_var.get()
         
         if not folder:
             messagebox.showerror("エラー", "共有フォルダを指定してください")
             return
         
-        if not password:
-            messagebox.showerror("エラー", "パスワードを入力してください")
+        if use_password and not password:
+            messagebox.showerror("エラー", "パスワード認証を使用する場合はパスワードを入力してください")
             return
         
         if not Path(folder).exists():
@@ -715,13 +901,9 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             messagebox.showerror("エラー", f"無効なポート番号です: {port_str}\n1～65535の範囲で指定してください")
             return
         
-        FHSHandler.shared_folder = folder
-        FHSHandler.password_hash = hashlib.sha256(password.encode()).hexdigest()
-        FHSHandler.log_callback = self.log_server
-        
         def run_server():
             try:
-                self.server = HTTPServer(("0.0.0.0", port), FHSHandler)
+                self.server = P2PServer(folder, password, port, use_password, use_ipban, self.log_server)
                 local_ip = self.get_local_ip()
                 server_addr = f"{local_ip}:{port}"
                 
@@ -730,11 +912,7 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
                 self.root.after(0, lambda: self.server_address_entry.insert(0, server_addr))
                 self.root.after(0, lambda: self.server_address_entry.config(state="readonly"))
                 
-                self.log_server(f"サーバー起動: {local_ip}:{port}")
-                self.log_server(f"共有フォルダ: {folder}")
-                self.log_server(f"接続待機中...")
-                
-                self.server.serve_forever()
+                self.server.start()
             except OSError as e:
                 if e.errno == 48 or e.errno == 10048:
                     self.log_server(f"[エラー] ポート{port}は既に使用中です")
@@ -751,7 +929,7 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
     
     def stop_server(self):
         if self.server:
-            self.server.shutdown()
+            self.server.stop()
             self.log_server("サーバー停止")
             self.server = None
             
@@ -766,13 +944,14 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
     def connect_to_server(self):
         address_input = self.address_entry.get()
         password = self.client_password_entry.get()
+        use_password = self.client_use_password_var.get()
         
         if not address_input:
             messagebox.showerror("エラー", "サーバーアドレスを入力してください")
             return
         
-        if not password:
-            messagebox.showerror("エラー", "パスワードを入力してください")
+        if use_password and not password:
+            messagebox.showerror("エラー", "パスワード認証を使用する場合はパスワードを入力してください")
             return
         
         try:
@@ -781,42 +960,24 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             messagebox.showerror("エラー", f"アドレスの解析に失敗しました:\n{address_input}\n\nエラー: {str(e)}")
             return
         
-        url = f"http://{host}:{port}/files"
-        auth_hash = hashlib.sha256(password.encode()).hexdigest()
-        
         self.status_label.config(text=f" 接続中: {host}:{port}")
         
         try:
-            req = urllib.request.Request(url, headers={"Authorization": auth_hash})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                files = json.loads(response.read().decode())
-                
-                self.file_listbox.delete(0, tk.END)
-                self.files_data = files
-                
-                for f in files:
-                    size_mb = f["size"] / (1024 * 1024)
-                    self.file_listbox.insert(tk.END, f"{f['name']}  ({size_mb:.2f} MB)")
-                
-                self.status_label.config(text=f" 接続成功: {len(files)}ファイル")
-                messagebox.showinfo("接続成功", f"{host}:{port}\n\n{len(files)}個のファイルが見つかりました")
-        except urllib.error.HTTPError as e:
-            self.status_label.config(text=" 接続失敗")
-            if e.code == 403:
-                messagebox.showerror("認証エラー", f"パスワードが正しくありません\n\nサーバー: {host}:{port}\nHTTPステータス: {e.code}")
-            elif e.code == 404:
-                messagebox.showerror("エラー", f"サーバーが見つかりません\n\nサーバー: {host}:{port}\nHTTPステータス: {e.code}")
-            else:
-                messagebox.showerror("HTTPエラー", f"サーバー: {host}:{port}\nHTTPステータス: {e.code}\n\n{str(e)}")
-        except urllib.error.URLError as e:
-            self.status_label.config(text=" 接続失敗")
-            messagebox.showerror("接続エラー", f"サーバーに接続できません\n\nサーバー: {host}:{port}\n\n理由:\n{str(e.reason)}")
-        except socket.timeout:
-            self.status_label.config(text=" 接続タイムアウト")
-            messagebox.showerror("タイムアウト", f"サーバーへの接続がタイムアウトしました\n\nサーバー: {host}:{port}\n\nネットワーク接続を確認してください")
+            client = P2PClient(host, port, password, use_password)
+            files = client.get_file_list()
+            
+            self.file_listbox.delete(0, tk.END)
+            self.files_data = files
+            
+            for f in files:
+                size_mb = f["size"] / (1024 * 1024)
+                self.file_listbox.insert(tk.END, f"{f['name']}  ({size_mb:.2f} MB)")
+            
+            self.status_label.config(text=f" 接続成功: {len(files)}ファイル")
+            messagebox.showinfo("接続成功", f"{host}:{port}\n\n{len(files)}個のファイルが見つかりました")
         except Exception as e:
-            self.status_label.config(text=" 接続エラー")
-            messagebox.showerror("エラー", f"予期しないエラーが発生しました\n\nサーバー: {host}:{port}\n\nエラー詳細:\n{type(e).__name__}: {str(e)}")
+            self.status_label.config(text=" 接続失敗")
+            messagebox.showerror("接続エラー", f"サーバーに接続できません\n\nサーバー: {host}:{port}\n\nエラー詳細:\n{type(e).__name__}: {str(e)}")
     
     def download_file(self):
         selections = self.file_listbox.curselection()
@@ -835,14 +996,13 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
         
         address_input = self.address_entry.get()
         password = self.client_password_entry.get()
+        use_password = self.client_use_password_var.get()
         
         try:
             host, port = self.parse_server_address(address_input)
         except Exception as e:
             messagebox.showerror("エラー", f"アドレスの解析に失敗しました:\n{str(e)}")
             return
-        
-        auth_hash = hashlib.sha256(password.encode()).hexdigest()
         
         success_count = 0
         fail_count = 0
@@ -851,46 +1011,28 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             file_info = self.files_data[idx]
             filename = file_info["name"]
             
-            # リトライ機能付きダウンロード
             max_retries = 3
             retry_count = 0
             downloaded = False
             
             while retry_count < max_retries and not downloaded:
-                # ファイル名をURLエンコード
-                encoded_filename = quote(filename, safe='/')
-                url = f"http://{host}:{port}/download/{encoded_filename}"
-                
                 try:
                     self.status_label.config(text=f" ダウンロード中 ({retry_count + 1}/{max_retries}): {filename}")
                     self.root.update()
                     
-                    # ファイル名をURLエンコード
-                    encoded_filename = quote(filename, safe='/')
-                    req = urllib.request.Request(f"http://{host}:{port}/download/{encoded_filename}", headers={"Authorization": auth_hash})
-                    req.add_header('Connection', 'keep-alive')
+                    client = P2PClient(host, port, password, use_password)
+                    data = client.download_file(filename)
                     
-                    with urllib.request.urlopen(req, timeout=120) as response:
-                        encrypted_data = response.read()
-                        
-                        if CRYPTO_AVAILABLE:
-                            decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
-                        else:
-                            decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
-                        
-                        save_file = Path(save_path) / Path(filename).name
-                        save_file.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        with open(save_file, "wb") as f:
-                            f.write(decrypted_data)
-                        
-                        success_count += 1
-                        downloaded = True
-                        
-                        # 連続ダウンロード時の待機時間
-                        import time
-                        time.sleep(0.1)
-                        
+                    save_file = Path(save_path) / Path(filename).name
+                    save_file.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    with open(save_file, "wb") as f:
+                        f.write(data)
+                    
+                    success_count += 1
+                    downloaded = True
+                    time.sleep(0.1)
+                    
                 except Exception as e:
                     retry_count += 1
                     error_msg = f"ファイル: {filename}\nエラー: {type(e).__name__}\n{str(e)}"
@@ -900,8 +1042,6 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
                         fail_count += 1
                         messagebox.showerror("ダウンロードエラー", f"ファイル: {filename}\n\n{max_retries}回リトライしましたが失敗しました。\n\nエラー: {type(e).__name__}\n{str(e)}")
                     else:
-                        # リトライ前に少し待機
-                        import time
                         time.sleep(0.5)
         
         if success_count > 0 or fail_count > 0:
@@ -932,6 +1072,7 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
         
         address_input = self.address_entry.get()
         password = self.client_password_entry.get()
+        use_password = self.client_use_password_var.get()
         
         try:
             host, port = self.parse_server_address(address_input)
@@ -939,54 +1080,34 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
             messagebox.showerror("エラー", f"アドレスの解析に失敗しました:\n{str(e)}")
             return
         
-        auth_hash = hashlib.sha256(password.encode()).hexdigest()
-        
         success_count = 0
         fail_count = 0
         
         for file_info in self.files_data:
             filename = file_info["name"]
             
-            # リトライ機能付きダウンロード
             max_retries = 3
             retry_count = 0
             downloaded = False
             
             while retry_count < max_retries and not downloaded:
-                # ファイル名をURLエンコード
-                encoded_filename = quote(filename, safe='/')
-                url = f"http://{host}:{port}/download/{encoded_filename}"
-                
                 try:
                     self.status_label.config(text=f" [{success_count + fail_count + 1}/{len(self.files_data)}] リトライ {retry_count + 1}/{max_retries}: {filename}")
                     self.root.update()
                     
-                    # ファイル名をURLエンコード
-                    encoded_filename = quote(filename, safe='/')
-                    req = urllib.request.Request(f"http://{host}:{port}/download/{encoded_filename}", headers={"Authorization": auth_hash})
-                    req.add_header('Connection', 'keep-alive')
+                    client = P2PClient(host, port, password, use_password)
+                    data = client.download_file(filename)
                     
-                    with urllib.request.urlopen(req, timeout=120) as response:
-                        encrypted_data = response.read()
-                        
-                        if CRYPTO_AVAILABLE:
-                            decrypted_data = Crypto.decrypt(encrypted_data, auth_hash)
-                        else:
-                            decrypted_data = Crypto.xor_decrypt(encrypted_data, auth_hash)
-                        
-                        save_file = Path(save_path) / filename
-                        save_file.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        with open(save_file, "wb") as f:
-                            f.write(decrypted_data)
-                        
-                        success_count += 1
-                        downloaded = True
-                        
-                        # 連続ダウンロード時の待機時間
-                        import time
-                        time.sleep(0.1)
-                        
+                    save_file = Path(save_path) / filename
+                    save_file.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    with open(save_file, "wb") as f:
+                        f.write(data)
+                    
+                    success_count += 1
+                    downloaded = True
+                    time.sleep(0.1)
+                    
                 except Exception as e:
                     retry_count += 1
                     error_msg = f"ファイル: {filename}\nエラー: {type(e).__name__}\n{str(e)}"
@@ -995,8 +1116,6 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
                     if retry_count >= max_retries:
                         fail_count += 1
                     else:
-                        # リトライ前に少し待機
-                        import time
                         time.sleep(0.5)
         
         self.status_label.config(text=f" 全ダウンロード完了: {success_count}成功 / {fail_count}失敗")
