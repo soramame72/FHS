@@ -536,17 +536,42 @@ class P2PClient:
         self.password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
         self.use_password = use_password
         self.local_port = local_port if local_port else random.randint(10000, 60000)
-    
-    def connect_with_hole_punching(self):
-        """ホールパンチングを試みてからTCP接続"""
-        HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
+
+        def connect_with_hole_punching(self):
+            """ホールパンチングを試みてからTCP接続を複数回リトライ"""
         
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.settimeout(30)
-        client_socket.connect((self.host, self.port))
+            # ★★★ 穴あけの直後にTCP接続を試行するため、UDPを連射する ★★★
+            for _ in range(5): 
+                HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
+                time.sleep(0.01) # 10ミリ秒待機
+
+            # TCP接続の試行も連射して、開いた穴を捉えにいく
+            max_retries = 10
+            for retry_count in range(max_retries):
+                try:
+                    # 接続試行ごとに、穴あけUDPを再度送信する
+                    HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
+                    time.sleep(0.01) 
+
+                    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                
+                    # ソースポートをUDPと同じに固定 (前回修正の維持)
+                    client_socket.bind(('0.0.0.0', self.local_port)) 
+                
+                    client_socket.settimeout(3) # タイムアウトを短く設定
+                    client_socket.connect((self.host, self.port))
+                
+                    print(f"[P2P] 接続成功 (リトライ {retry_count + 1}回目)")
+                    return client_socket
+            
+                except Exception as e:
+                    # 接続拒否（Connection refused）の場合、リトライを継続
+                    print(f"[P2P] 接続失敗 (リトライ {retry_count + 1}/{max_retries}): {e}")
+                    time.sleep(0.5)
         
-        return client_socket
-    
+            # 最終的に失敗した場合はエラーを再送出
+            raise ConnectionRefusedError(f"[Errno 61] Connection refused (Max retries reached: {max_retries})")
+            
     def connect_and_send(self, request):
         client_socket = self.connect_with_hole_punching()
         
