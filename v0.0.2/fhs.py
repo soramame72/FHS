@@ -14,6 +14,12 @@ from datetime import datetime
 import socket
 import struct
 import random
+import subprocess
+import signal
+import requests
+
+
+
 
 # 暗号化関連
 try:
@@ -344,7 +350,12 @@ class P2PServer:
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(("0.0.0.0", self.port))
+            self.server_socket.bind(('', self.port))
+
+            self.ngrok_process = None  # ★★★ ngrokプロセスを格納する変数 ★★★
+            self.ngrok_host = ""       # ★★★ ngrokの公開ホスト名 ★★★
+            self.ngrok_port = ""       # ★★★ ngrokの公開ポート番号 ★★★
+            
             self.server_socket.listen(5)
             self.log_callback(f"[起動] P2Pサーバー起動: 0.0.0.0:{self.port}")
             
@@ -354,6 +365,11 @@ class P2PServer:
                 self.log_callback("[情報] パスワード認証: 無効")
             if not self.use_ipban:
                 self.log_callback("[情報] IPブロック: 無効")
+
+            if not self.start_ngrok_tunnel():
+                # ngrok起動に失敗した場合
+                self.log_callback("[エラー] ngrokトンネル開始に失敗したため、サーバーを起動できませんでした。")
+                return 
             
             while self.running:
                 try:
@@ -515,6 +531,9 @@ class P2PServer:
     
     def stop(self):
         self.running = False
+
+        self.stop_ngrok_tunnel()
+
         if self.server_socket:
             try:
                 self.server_socket.close()
@@ -526,6 +545,82 @@ class P2PServer:
             except:
                 pass
 
+    def start_ngrok_tunnel(self):
+        """ngrokトンネルを開始し、公開アドレスを取得する"""
+        if self.ngrok_process:
+            self.stop_ngrok_tunnel() # 既に動いている場合は停止
+
+        try:
+            # FHS.pyと同じ場所にあるngrok実行ファイルを指定 (Mac/Linux用)
+            NGROK_CMD = './ngrok'
+            if sys.platform.startswith('win'):
+                NGROK_CMD = 'ngrok'
+            
+            # FHSが使っているポートをtcpトンネルで公開するコマンド
+            cmd = [NGROK_CMD, 'tcp', str(self.port)]
+            
+            # ngrokをバックグラウンドで起動
+            self.ngrok_process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True
+            )
+            
+            # ngrokのAPIが立ち上がるまで待機し、公開URLを取得（より確実な方法）
+            api_url = "http://127.0.0.1:4040/api/tunnels"
+            
+            # APIが立ち上がるまで最大5回リトライ
+            for _ in range(5):
+                try:
+                    response = requests.get(api_url, timeout=3)
+                    data = response.json()
+
+                    if data and data['tunnels']:
+                        tunnel_info = data['tunnels'][0]
+                        forwarding_url = tunnel_info['public_url'] 
+
+                        if forwarding_url.startswith('tcp://'):
+                            parts = forwarding_url[6:].split(':')
+                            self.ngrok_host = parts[0]
+                            self.ngrok_port = parts[1]
+                            
+                            print(f"[NGROK] トンネル開始成功: {self.ngrok_host}:{self.ngrok_port}")
+                            return True
+                    
+                except requests.exceptions.ConnectionError:
+                    time.sleep(1) # 1秒待ってリトライ
+                except Exception as e:
+                    print(f"[NGROK] APIデータ解析エラー: {e}")
+                    break
+
+            # 失敗した場合
+            print("[NGROK] トンネル確立に失敗しました。ngrokプロセスを停止します。")
+            self.stop_ngrok_tunnel()
+            return False
+
+        except FileNotFoundError:
+            print("[NGROK] エラー: 'ngrok'実行ファイルが見つかりません。FHS.pyと同じ場所に置いてください。")
+            return False
+        except Exception as e:
+            print(f"[NGROK] 予期せぬ起動エラー: {e}")
+            self.stop_ngrok_tunnel()
+            return False
+
+    def stop_ngrok_tunnel(self):
+        """ngrokトンネルを停止する"""
+        if self.ngrok_process:
+            print("[NGROK] トンネル停止中...")
+            try:
+                # プロセスに終了を要求し、強制終了で確実に停止させる
+                self.ngrok_process.terminate() 
+                self.ngrok_process.send_signal(signal.SIGKILL)
+                self.ngrok_process.wait(timeout=5)
+            except Exception as e:
+                print(f"[NGROK] 停止エラー: {e}")
+            finally:
+                self.ngrok_process = None
+                print("[NGROK] トンネル停止完了")
 
 # ========== P2Pクライアント ==========
 class P2PClient:
@@ -537,41 +632,36 @@ class P2PClient:
         self.use_password = use_password
         self.local_port = local_port if local_port else random.randint(10000, 60000)
 
-        def connect_with_hole_punching(self):
-            """ホールパンチングを試みてからTCP接続を複数回リトライ"""
+    def connect_with_hole_punching(self):
+        """ホールパンチングを試みてからTCP接続を複数回リトライ"""
         
-            # ★★★ 穴あけの直後にTCP接続を試行するため、UDPを連射する ★★★
-            for _ in range(5): 
+        import time 
+        for _ in range(5): 
+            HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
+            time.sleep(0.01) 
+
+        max_retries = 10
+        for retry_count in range(max_retries):
+            try:
                 HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
-                time.sleep(0.01) # 10ミリ秒待機
+                time.sleep(0.01) 
 
-            # TCP接続の試行も連射して、開いた穴を捉えにいく
-            max_retries = 10
-            for retry_count in range(max_retries):
-                try:
-                    # 接続試行ごとに、穴あけUDPを再度送信する
-                    HolePunchingManager.punch_hole(self.local_port, self.host, self.port)
-                    time.sleep(0.01) 
-
-                    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.bind(('0.0.0.0', self.local_port)) 
+                client_socket.settimeout(3) 
+                client_socket.connect((self.host, self.port))
                 
-                    # ソースポートをUDPと同じに固定 (前回修正の維持)
-                    client_socket.bind(('0.0.0.0', self.local_port)) 
-                
-                    client_socket.settimeout(3) # タイムアウトを短く設定
-                    client_socket.connect((self.host, self.port))
-                
-                    print(f"[P2P] 接続成功 (リトライ {retry_count + 1}回目)")
-                    return client_socket
+                print(f"[P2P] 接続成功 (リトライ {retry_count + 1}回目)")
+                return client_socket
             
-                except Exception as e:
-                    # 接続拒否（Connection refused）の場合、リトライを継続
-                    print(f"[P2P] 接続失敗 (リトライ {retry_count + 1}/{max_retries}): {e}")
-                    time.sleep(0.5)
+            except Exception as e:
+                # 接続拒否（Connection refused）の場合、リトライを継続
+                print(f"[P2P] 接続失敗 (リトライ {retry_count + 1}/{max_retries}): {e}")
+                time.sleep(0.5)
         
-            # 最終的に失敗した場合はエラーを再送出
-            raise ConnectionRefusedError(f"[Errno 61] Connection refused (Max retries reached: {max_retries})")
-            
+        # 最終的に失敗した場合はエラーを再送出
+        raise ConnectionRefusedError(f"[Errno 61] Connection refused (Max retries reached: {max_retries})")
+
     def connect_and_send(self, request):
         client_socket = self.connect_with_hole_punching()
         
@@ -701,7 +791,6 @@ class Win98Button(tk.Button):
     def on_release(self, e):
         if self['state'] != 'disabled':
             self['relief'] = tk.RAISED
-
 
 # ========== メインアプリケーション ==========
 class FHSApp:
@@ -1348,9 +1437,24 @@ Webサイト http://mamechosu.s323.xrea.com/software/fhs/index.html
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
         
+        # ★★★ ここに ngrok 対応のステータス更新ロジックを挿入 ★★★
+        if self.server and self.server.running:
+            # ngrokが起動に成功したかチェック
+            if self.server.ngrok_process:
+                ngrok_addr = f"{self.server.ngrok_host}:{self.server.ngrok_port}"
+                # ユーザーに伝えるべきngrokアドレスを表示
+                self.status_label.config(text=f" サーバー起動 | 外部接続アドレス: {ngrok_addr} (お客様へ伝えてください)")
+            else:
+                # ngrok起動に失敗した場合 (P2PServer.start内でngrokエラーによりreturnした場合)
+                self.status_label.config(text=f" サーバー起動失敗 | エラー: ngrokトンネルを開始できませんでした。ログを確認してください。")
+        else:
+            # サーバー起動自体がtry/exceptで失敗した場合
+            self.status_label.config(text=f" サーバー起動失敗 | エラー: 処理ログを確認してください。")
+        # ★★★ 挿入終了 ★★★
+        
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-    
+        
     def stop_server(self):
         if self.server:
             self.server.stop()
